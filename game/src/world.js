@@ -1,124 +1,238 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+// The heist itself: the rooms, the thief, the guards, the cameras, the alarm and the
+// score, with no drawing and no browser in it. step() advances one fixed step and returns
+// what happened as bit flags, so the caller can react without the world knowing about
+// screens or sound.
+import { ALARM, SCORE, STEP, THIEF, TOOLS, VIEW } from './config.js';
+import { LEVELS } from './levels.js';
+import { createGuard, guardCatches, guardSees, stepGuard, GUARD_CHASE, GUARD_INVESTIGATE } from './guard.js';
+import { cameraSees, createCamera, stepCamera } from './camera.js';
+import { createThief, moveThief, refillCharges, spendCharge } from './thief.js';
+import { createAlarm, stepAlarm } from './alarm.js';
+import { createToolField, dropSmoke, empActive, fireEmp, inSmoke, stepTools, throwCoin } from './tools.js';
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
+export const EVENT_PICKUP = 1;
+export const EVENT_GEM = 2;
+export const EVENT_CAUGHT = 4;
+export const EVENT_ESCAPED = 8;
+export const EVENT_ROOM_DONE = 16;
+export const EVENT_TOOL = 32;
+export const EVENT_SPOTTED = 64;
 
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
+function inRect(point, rect, pad = 0) {
+  return point.x >= rect.x - pad && point.x <= rect.x + rect.w + pad && point.y >= rect.y - pad && point.y <= rect.y + rect.h + pad;
+}
 
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+function circleHitsRect(x, y, radius, rect) {
+  const cx = Math.max(rect.x, Math.min(x, rect.x + rect.w));
+  const cy = Math.max(rect.y, Math.min(y, rect.y + rect.h));
+  return Math.hypot(x - cx, y - cy) < radius;
 }
 
 export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
+  const state = {
+    roomIndex: 0,
+    level: null,
+    thief: null,
+    guards: [],
+    cameras: [],
+    alarm: createAlarm(),
+    tools: createToolField(),
+    score: 0,
+    loot: 0,
+    elapsed: 0,
+    roomElapsed: 0,
+    ghost: true,
+    gemTaken: false,
+    escaped: false,
+    caught: false,
+    message: '',
+    messageUntil: 0,
+  };
+
+  function loadRoom(index) {
+    const def = LEVELS[index];
+    state.roomIndex = index;
+    state.level = {
+      ...def,
+      trinkets: def.trinkets.map((t) => ({ ...t })),
+      kits: def.kits.map((k) => ({ ...k })),
+    };
+    state.thief = createThief(def.spawn);
+    state.thief.charges = state.savedCharges ?? { coin: TOOLS.coin.start, smoke: TOOLS.smoke.start, emp: TOOLS.emp.start };
+    state.guards = def.guards.map(createGuard);
+    state.cameras = def.cameras.map(createCamera);
+    state.alarm = createAlarm();
+    state.tools = createToolField();
+    state.gemTaken = false;
+    state.roomElapsed = 0;
+    state.ghost = true;
+    state.message = def.brief;
+    state.messageUntil = state.elapsed + 4;
   }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
 
   function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
     state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
+    state.loot = 0;
     state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
+    state.escaped = false;
+    state.caught = false;
+    state.savedCharges = undefined;
+    loadRoom(0);
   }
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
-    return null;
+  function solidAt(x, y) {
+    if (x < 0 || x > VIEW.width || y < 0 || y > VIEW.height) return true;
+    for (const wall of state.level.walls) if (inRect({ x, y }, wall)) return true;
+    for (const c of state.level.cover) if (circleHitsRect(x, y, THIEF.radius, c)) return true;
+    return false;
   }
 
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
+  /** Does a straight line from `a` to `b` cross any wall or cover? Sampled every 8px. */
+  function hasLineOfSight(a, b) {
+    const dist = Math.hypot(b.x - a.x, b.y - a.y);
+    const steps = Math.max(1, Math.ceil(dist / 8));
+    for (let i = 1; i < steps; i += 1) {
+      const x = a.x + ((b.x - a.x) * i) / steps;
+      const y = a.y + ((b.y - a.y) * i) / steps;
+      for (const wall of state.level.walls) if (inRect({ x, y }, wall)) return false;
+      for (const c of state.level.cover) if (inRect({ x, y }, c)) return false;
+    }
+    return true;
   }
 
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
+  function thiefInShadow() {
+    return state.level.shadows.some((s) => inRect(state.thief, s));
   }
 
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
-  }
-
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
+  /** Advance one fixed step. `move` is {x, y} (-1..1 each); `sneak`/`sprint` are held keys. */
+  function step(dt, move, sneak, sprint, toolUse) {
+    if (state.caught || state.escaped) return 0;
     let events = 0;
     state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
+    state.roomElapsed += dt;
 
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
+    moveThief(state.thief, move, dt, sneak, sprint, (x, y) => solidAt(x, y));
 
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
-    }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
-
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
+    // Tools, spent on the player's say-so.
+    if (toolUse) {
+      if (toolUse.kind === 'coin' && spendCharge(state.thief, 'coin')) {
+        throwCoin(state.tools, state.thief, toolUse.at, state.elapsed);
+        events |= EVENT_TOOL;
+      } else if (toolUse.kind === 'smoke' && spendCharge(state.thief, 'smoke')) {
+        dropSmoke(state.tools, state.thief);
+        events |= EVENT_TOOL;
+      } else if (toolUse.kind === 'emp' && spendCharge(state.thief, 'emp')) {
+        fireEmp(state.tools, state.elapsed);
+        events |= EVENT_TOOL;
       }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
+    }
+    stepTools(state.tools, dt);
+
+    const hidden = inSmoke(state.tools, state.thief);
+    const shadow = thiefInShadow();
+
+    // Guards see, suspect, chase; a ringing coin pulls the nearest ones off patrol.
+    let heat = 'none';
+    let anyChase = false;
+    for (const guard of state.guards) {
+      for (const coin of state.tools.coins) {
+        if (guard.state !== GUARD_CHASE && Math.hypot(coin.x - guard.x, coin.y - guard.y) < TOOLS.coin.hearRadius) {
+          guard.state = GUARD_INVESTIGATE;
+          guard.investigate = { x: coin.x, y: coin.y };
         }
       }
+      const see = hidden
+        ? { visible: false, exposure: 0, close: false }
+        : guardSees(guard, state.thief, state.thief.sneaking, shadow, hasLineOfSight);
+      if (see.visible) {
+        heat = 'seen';
+        if (guard.suspicion >= 0.4) events |= EVENT_SPOTTED;
+      }
+      stepGuard(guard, dt, see, state.thief, random);
+      if (guard.state === GUARD_CHASE) {
+        anyChase = true;
+        heat = 'chase';
+      }
+      if (guard.state === GUARD_CHASE && guardCatches(guard, state.thief)) {
+        state.caught = true;
+        return events | EVENT_CAUGHT;
+      }
+    }
+
+    // Cameras sweep; while one watches, the alarm climbs and guards get curious.
+    for (const camera of state.cameras) {
+      stepCamera(camera, dt);
+      if (empActive(state.tools, state.elapsed)) camera.disabled = Math.max(camera.disabled, 0.5);
+      if (!hidden && cameraSees(camera, state.thief, hasLineOfSight)) {
+        if (heat === 'none') heat = 'camera';
+        for (const guard of state.guards) {
+          if (guard.state !== GUARD_CHASE && guard.suspicion < 0.4) {
+            guard.suspicion = Math.min(0.55, guard.suspicion + 0.5 * dt);
+            guard.lastSeen = { x: state.thief.x, y: state.thief.y };
+          }
+        }
+      }
+    }
+    if (anyChase) heat = 'chase';
+    stepAlarm(state.alarm, dt, heat);
+    if (state.alarm.peak > 25) state.ghost = false;
+
+    // Lockdown: every guard sprints for the last place the thief was seen.
+    if (state.alarm.lockdown) {
+      for (const guard of state.guards) {
+        if (guard.state !== GUARD_CHASE) {
+          guard.state = GUARD_CHASE;
+          guard.suspicion = 1;
+          guard.lastSeen = guard.lastSeen ?? { x: state.thief.x, y: state.thief.y };
+        }
+      }
+    }
+
+    // Pickups: trinkets, tool kits, and the gem itself.
+    const thief = state.thief;
+    for (const trinket of state.level.trinkets) {
+      if (!trinket.taken && Math.hypot(trinket.x - thief.x, trinket.y - thief.y) < THIEF.grabRange) {
+        trinket.taken = true;
+        state.score += SCORE.trinket;
+        state.loot += SCORE.trinket;
+        events |= EVENT_PICKUP;
+      }
+    }
+    for (const kit of state.level.kits) {
+      if (!kit.taken && Math.hypot(kit.x - thief.x, kit.y - thief.y) < THIEF.grabRange) {
+        kit.taken = true;
+        refillCharges(thief);
+        state.score += SCORE.kit;
+        events |= EVENT_PICKUP;
+      }
+    }
+    const gem = state.level.gem;
+    if (!state.gemTaken && Math.hypot(gem.x - thief.x, gem.y - thief.y) < THIEF.grabRange + 6) {
+      state.gemTaken = true;
+      thief.hasGem = true;
+      state.score += SCORE.gem;
+      state.loot += SCORE.gem;
+      state.message = 'The Argent Star is yours. Get out the east door!';
+      state.messageUntil = state.elapsed + 4;
+      events |= EVENT_GEM;
+    }
+
+    // The exit: only open once the gem is taken.
+    if (state.gemTaken && inRect(thief, state.level.exit)) {
+      const timeBonus = Math.max(0, Math.round((300 - state.roomElapsed) * SCORE.timeBonusPerSecond));
+      state.score += timeBonus;
+      if (state.ghost) state.score += SCORE.ghostBonus;
+      state.savedCharges = { ...thief.charges };
+      if (state.roomIndex + 1 >= LEVELS.length) {
+        state.escaped = true;
+        return events | EVENT_ESCAPED;
+      }
+      loadRoom(state.roomIndex + 1);
+      return events | EVENT_ROOM_DONE;
     }
     return events;
   }
 
   reset();
-  return { state, reset, step };
+  return { state, reset, loadRoom, step, solidAt, hasLineOfSight, thiefInShadow };
 }

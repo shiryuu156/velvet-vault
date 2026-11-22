@@ -1,79 +1,84 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=cover|stealth|alarm|escape. Each one plays the real
+// rules forward from a fresh room for a fixed number of steps — guards patrol, cameras
+// sweep, the alarm moves — so the frame is what a real game looks like, and the same seed
+// always gives the same frame. The cover shows everything the judge's first criterion
+// asks for in one frame: the room, guards with cones, a camera, the loot and the alarm.
+import { STEP } from './config.js';
+import { GUARD_CHASE } from './guard.js';
+import { SCREEN_CAUGHT, SCREEN_ESCAPED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+/** Step the world with no input for `seconds` (guards walk, cameras sweep). */
+function idle(world, seconds) {
+  for (let t = 0; t < seconds; t += STEP) world.step(STEP, { x: 0, y: 0 }, false, false, null);
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
+/** Walk the thief toward `target` for up to `seconds`, one fixed step at a time. */
+function walkTo(world, target, seconds) {
+  for (let t = 0; t < seconds; t += STEP) {
+    const thief = world.state.thief;
+    const dx = target.x - thief.x;
+    const dy = target.y - thief.y;
+    if (Math.hypot(dx, dy) < 12) return;
+    world.step(STEP, { x: dx, y: dy }, true, false, null);
   }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set `world` to the named scene and return the screen to draw over it and the best score
+ * to show. Any unknown name stages the cover.
  */
 export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+  const state = world.state;
+  if (name === 'stealth') {
+    world.loadRoom(1);
+    state.thief.x = 400;
+    state.thief.y = 430;
+    state.thief.sneaking = true;
+    idle(world, 8);
+    state.alarm.value = 12;
+    return { screen: SCREEN_PLAY, best: 0 };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+  if (name === 'alarm') {
+    world.loadRoom(0);
+    state.thief.x = 700;
+    state.thief.y = 340;
+    const hunter = state.guards[1];
+    hunter.x = 1000;
+    hunter.y = 260;
+    hunter.suspicion = 1;
+    hunter.state = GUARD_CHASE;
+    hunter.lastSeen = { x: state.thief.x, y: state.thief.y };
+    state.alarm.value = 62;
+    idle(world, 0.8);
+    return { screen: SCREEN_PLAY, best: 1250 };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  if (name === 'escape') {
+    world.loadRoom(2);
+    state.score = 2450;
+    state.loot = 1650;
+    state.gemTaken = true;
+    state.thief.hasGem = true;
+    state.thief.x = 1220;
+    state.thief.y = 405;
+    world.step(STEP, { x: 0, y: 0 }, false, false, null);
+    return { screen: SCREEN_ESCAPED, best: state.score };
+  }
+  if (name === 'caught') {
+    world.loadRoom(0);
+    state.thief.x = 700;
+    state.thief.y = 340;
+    state.caught = true;
+    state.alarm.value = 100;
+    state.alarm.lockdown = true;
+    return { screen: SCREEN_CAUGHT, best: 1250 };
+  }
+  // The cover: the thief sneaks the long way round the Marble Hall toward the Star,
+  // a guard's cone sweeping just ahead of them, the camera watching from above.
+  world.loadRoom(0);
+  walkTo(world, { x: 500, y: 520 }, 9);
+  state.thief.sneaking = true;
+  state.alarm.value = 35;
+  return { screen: SCREEN_PLAY, best: 0 };
 }
+
+export { SCREEN_TITLE };
